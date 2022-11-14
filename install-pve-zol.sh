@@ -12,6 +12,8 @@ DISK_IDS=(
   "wwn-0x0000000000000002"
 )
 
+ZPOOL_TYPE="mirror"
+
 BOOT_TYPE="EFI"
 
 CRYPTSETUP_PASSPHRASE="password"
@@ -38,6 +40,8 @@ CMDLINE_LINUX=""
 SSH_USER="user"
 SSH_KEY=""
 
+[[ "${#DISK_IDS[@]}" -lt 2 ]] && ZPOOL_TYPE=""
+
 export LC_ALL="en_US.UTF-8"
 
 echo_section() {
@@ -53,11 +57,11 @@ echo_section "Configure live system"
 echo_section "Install ZOL and dependencies"
 if ! modinfo zfs &> /dev/null; then
 ( set -x
-  echo "deb http://deb.debian.org/debian buster-backports main contrib" \
-    > /etc/apt/sources.list.d/buster-backports.list
+  echo "deb http://deb.debian.org/debian bullseye-backports main contrib" \
+    > /etc/apt/sources.list.d/bullseye-backports.list
   apt-get update
   apt-get install --yes curl debootstrap efibootmgr gdisk dkms dpkg-dev rng-tools "linux-headers-$(uname -r)"
-  apt-get install --yes -t buster-backports --no-install-recommends zfs-dkms zfsutils-linux
+  apt-get install --yes -t bullseye-backports --no-install-recommends zfs-dkms zfsutils-linux
   modprobe zfs
 )
 else
@@ -70,9 +74,9 @@ for id in "${DISK_IDS[@]}"; do
   # clear disk
   wipefs -af "/dev/disk/by-id/${id}"
   sgdisk --zap-all "/dev/disk/by-id/${id}"
+  sync && partprobe "/dev/disk/by-id/${id}"
 
   # discard device sectors
-  sync && partprobe "/dev/disk/by-id/${id}"
   blkdiscard -sv "/dev/disk/by-id/${id}" || true
 
   if [[ "${BOOT_TYPE}" == "BIOS" ]]; then
@@ -87,7 +91,7 @@ for id in "${DISK_IDS[@]}"; do
 
   # Let the kernel reread the partition table
   sync && partprobe "/dev/disk/by-id/${id}"
-  while [[ ! -b "/dev/disk/by-id/${id}-part4" ]]; do sleep 0.5; done
+  while [[ ! -b "/dev/disk/by-id/${id}-part4" ]] || (sleep 3; false); do sleep 0.5; done
 )
 done
 
@@ -135,7 +139,7 @@ echo_section "Create boot pool"
     -O acltype=posixacl -O canmount=off -O compression=lz4 -O devices=off \
     -O normalization=formD -O relatime=on -O xattr=sa \
     -O mountpoint=/ -R /target -f \
-    "bpool" mirror "${parts[@]}"
+    "bpool" ${ZPOOL_TYPE} "${parts[@]}"
 )
 
 echo_section "Create root pool"
@@ -144,7 +148,7 @@ echo_section "Create root pool"
     -O acltype=posixacl -O canmount=off -O compression=lz4 \
     -O dnodesize=auto -O normalization=formD -O relatime=on -O xattr=sa \
     -O mountpoint=/ -R /target \
-    "rpool" mirror $(printf "/dev/mapper/rpool%s_crypt " "${!DISK_IDS[@]}")
+    "rpool" ${ZPOOL_TYPE} $(printf "/dev/mapper/rpool%s_crypt " "${!DISK_IDS[@]}")
 )
 
 echo_section "Create datasets"
@@ -207,7 +211,7 @@ echo_section "Create swap zvol"
 
 echo_section "Install the minimal system"
 ( set -x
-  debootstrap --arch amd64 buster /target http://deb.debian.org/debian
+  debootstrap --arch amd64 bullseye /target http://deb.debian.org/debian
   zfs set devices=off rpool
 )
 
@@ -237,46 +241,45 @@ echo "${TARGET_IPADDRESS%/*}       ${TARGET_HOSTNAME}" >> /etc/hosts
 
 echo_section "Configure package sources"
 cat <<EOF > /etc/apt/sources.list
-deb http://deb.debian.org/debian buster main contrib
-#deb-src http://deb.debian.org/debian buster main contrib
+deb http://deb.debian.org/debian bullseye main contrib
+#deb-src http://deb.debian.org/debian bullseye main contrib
 
-deb http://security.debian.org/debian-security buster/updates main contrib
-#deb-src http://security.debian.org/debian-security buster/updates main contrib
+deb http://security.debian.org/debian-security bullseye-security main contrib
+#deb-src http://security.debian.org/debian-security bullseye-security main contrib
 
-deb http://deb.debian.org/debian buster-updates main contrib
-#deb-src http://deb.debian.org/debian buster-updates main contrib
+deb http://deb.debian.org/debian bullseye-updates main contrib
+#deb-src http://deb.debian.org/debian bullseye-updates main contrib
 EOF
 
 echo_section "Configure proxmox pve repository"
-echo "deb http://download.proxmox.com/debian/pve buster pve-no-subscription" \
+echo "deb http://download.proxmox.com/debian/pve bullseye pve-no-subscription" \
   > /etc/apt/sources.list.d/proxmox.list
 
-base64 -d <<EOF > /etc/apt/trusted.gpg.d/proxmox-ve-release-6.x.gpg
-mQINBFvydv4BEACqs61eF4B+Zz9H0hKJS72SEofK2Gy6a5wZ/Hb4DrGbbfC6fjrOb3r4ZrM7G355
-TD5He7qzcGrxJjgGwH+/w6xRyYliIzxD/lp8UJXcmiZHG+MYYJP6q29NWrbEcqPo6onx2tzNytHI
-UysqUE+mghXtyMN7KUMip7bDAqx2L51CI180Giv1wdKUBP2bgKVObyFzK46ZEMzyl2qr9raFnHA8
-oF1HZRkwwcfSD/dkY7oJvAO1pXgR8PzcXnXjoRTCyWlYVZYn54y9OjnB+knN8BlSOLNdBkKZs74X
-yJ9JlQU9ZfzatXXEhMxdDquIAg+g/W9rLpLz5XAGb2GSNvKrU5otjOdUOnD0k1MpFujsSzRWZCIR
-nywfmQ/Lahgo4wYOrQLNGCNdvwMgbwcD9NRjQsPdja94wJNRsmbhFeAKPyF8p3lf9QUHY3Vn1iGI
-6ut7c3uqUv0lKvujroKNc/hFSgcn8bUB+x0OnKE3yEiiGsEyJHGxVhjy3FsY/h1SNtM57Wwk9zxj
-Nuqp66jZcTu8foLNh6Ct+mFsor2Y6MxKVJvrcb9rXv54YpQAZUjvZK5gnqOWTWrEZkjtNLoGiyuW
-OU+2RoqTtRA22u9Vlm5C/lduGC7akbVGXd8ocDrq4t5IyM3bqF3oru7zGW0hQgsPwbkQcfOawFkQ
-lGEDzf1TrXTafwARAQABtElQcm94bW94IFZpcnR1YWwgRW52aXJvbm1lbnQgNi54IFJlbGVhc2Ug
-S2V5IDxwcm94bW94LXJlbGVhc2VAcHJveG1veC5jb20+iQJUBBMBCAA+FiEENTR5+DeB1/jtX1rF
-e/KBLopuiOAFAlvydv4CGwMFCRLMAwAFCwkIBwIGFQgJCgsCBBYCAwECHgECF4AACgkQe/KBLopu
-iODQZRAAo0kXc090pNskVDr0qB7T2x8UShxvC5E6imZHASq/ui1wd5Wei+WkPj4ME/1yAvpMrMAq
-3LbbIgmHbBqzsagQaeL88vWn5c0NtzsrzHoU+ql5XrCnbnmXBoCGUgiXA3vq0FaemTzfCBGnHPbs
-OoPlvHZjXPvpnMOomO39o1xaw2Ny8fhhv651CjPpK7DQF5KoMm3LdjXB6nouErJJZDvUaNmGNhHh
-4HzWiOSLyaE8T0UsUR1HqGkzvgE2OuwPjeWFIIRPKeiCFbA+mlEfwb/Lgu6F4D6IsP++ItuG6Q6Y
-jAopuK7QXrnFpDfAZmQsbsOgkqqg5dy7xBJATuCPkUk9qMBaeLVqkANq1OlZksPTry2399U83i69
-xsJNW4BBC0JXKWWJpq5d9ZH05OP9wxYR2+K3Hmh4vvkzcgoMEbnFrFzpH+eGkWxxZS1AGhMJBXGk
-mm1eW7ZFQVx6o0w9dWRRqDo7UklVNPImtXuso3nIwuYF0+Dv6PeE8EQWLp4FQGHlaEoUmYFug4xi
-WF1tCcW6UWy6fEhVAcXbbD0IvUjS6pL9IKpyOWDJBV0Tya4LmBAzaPB7ljYfEBASvaPVKDcSva6w
-EM8/vA6Oal2/LVdQ8TG5eRrtWxeZxZSQknv0v3IhPujyP9dxvhJfZmVZKQx/oPgEWFmGuQ8ggXtN
-ZL/872I=
+base64 -d <<EOF > /etc/apt/trusted.gpg.d/proxmox-release-bullseye.gpg
+mQINBF+o6NQBEADdEeL7hTwBlX9kbRwf3ESa+H/LOjEUGEvpZkk5kMysIi+4DTXL79LoZwQZXGKM
+3W6it7kF/YkE8hcGnHrFYKCcfmu3rGpQSF8v867xR6km0bzIRvLQXYYO3SL3SBDOlp4OuGwbcb+E
+9/oacVhfZY6d94AhGx2rueDW+YcUDC/nQrDnIJfd+yurm1sHoZMG4cx43Y9Q5BlckyZN1Gt7KFSE
+To9seayxJ47+IOMCw3s1nOyXWtUD7YrihSjQmhLd4jOJgLy7sSwOHnkrVfvvhIz6JfFn/ccGvPqK
+72dddgX2aF/VT5LkSF9d6yi5Ea4/AENMLqljnw74b+uvOa6wT4zjqQHTu7Wj3xLr711o9VsSbGSu
+RBP3Stwj2z6Xy8fTKChN8DkUal6HEtIVBvCs1jtioqdigoUY0cnHwGor1/yKMWsKjt5tqWjGMnBD
+dLWngTM61yh4WtvxDh1zLK5Q0xGaIYDPrgcRhnO456+8JIGVoQVg6bu5g5m9ua1KRTsr+TaqctDw
+DMqhhzqDAZpGuNgpHF7ycDYrof7sYFgQ1n3S/+yCpYJxTJOIvAdmkUTuHwDRkXqGvR4eyGy8/RZ0
+KMQ7oVJbMyZextOZBbUE95FbE7EB8iOt9NZHH2pgBZojYhD9P4+xwSyTymR2t/SdpvmOROjOtIDx
+bQqdBvmDUy33DQARAQABtDpQcm94bW94IEJ1bGxzZXllIFJlbGVhc2UgS2V5IDxwcm94bW94LXJl
+bGVhc2VAcHJveG1veC5jb20+iQJUBBMBCgA+FiEEKBOaL4ML1oR4oaAf3UujkX4jv1kFAl+o6NQC
+GwMFCRLMAwAFCwkIBwIGFQoJCAsCBBYCAwECHgECF4AACgkQ3UujkX4jv1k3qxAAq5ggmp54L/LC
+dfqNlMlloqiWerxhEYDZ+bBq6IFJtOcctm4kyrRUizRo2SUiO1wmPLjWcfQ1gUYP9ZgECNTzOGi7
+o9z+lk76tQiH6GeckLOxTqvilOaxwfpJrvKDBOp8e0yl7BSyNtnbMpaX5+vH9gNl+pWpzFuNmBMz
+85jkuI1qaoMDAbzY7Tg4YmkRO6Z/6Mj1F0vyQldTIB45hUtdzOkNaE/Pa4jBhb8jZ2DPGbz7QqEU
+vsdbR06FaiFLtZmLBQ6/yTXtUy/SbyIr+LlNmThkifohqzP9VGFy3DYuLskL/GF9w1Jb4TE5vobc
+U6DdY1nF5j4BbfwdaiOOm5n3dIy7QtqCZ0apDXTpn211GszjCL4AfdhsfvovBUYWLAE6bEZImJUq
+iyTW/a96zDbc1zulAtDvuZNWH05nlrdNomTk70HDEth/GQ02O4jKbZxwWe/CWB0e9CvAssEFJZ5j
+Id7guA0WsIz689tBJGYVMPc0WFL9Kuw3gweMd3TT/r/lqy0eDgsxT2ym1/Jg9Kj6Ko2rAfX/Sr9O
+dXwE2X8e745Z9HTABtxgSnFwCnfv/9QHrlfnn1C4e7QEcTuoen8JSOKlTYzoeFGDRuVi5uI+lFfI
+F1DZiWPnnvSmyYp3DPj7a1gXa3vX3EiIHWNYZzGEhyblqT9Oj7HFiFRGK2gWh5M=
 EOF
 
-chmod +r /etc/apt/trusted.gpg.d/proxmox-ve-release-6.x.gpg
+chmod +r /etc/apt/trusted.gpg.d/proxmox-release-bullseye.gpg
 
 echo_section "Configure a basic system environment"
 ln -s /proc/self/mounts /etc/mtab
