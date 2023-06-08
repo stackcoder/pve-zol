@@ -50,18 +50,18 @@ echo_section() {
 
 echo_section "Configure live system"
 ( set -x
-  gsettings set org.gnome.desktop.media-handling automount false
-  systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+  gsettings set org.gnome.desktop.media-handling automount false || true
+  systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target || true
 )
 
 echo_section "Install ZOL and dependencies"
 if ! modinfo zfs &> /dev/null; then
 ( set -x
-  echo "deb http://deb.debian.org/debian bullseye-backports main contrib" \
-    > /etc/apt/sources.list.d/bullseye-backports.list
+  echo "deb http://deb.debian.org/debian bullseye contrib" \
+    > /etc/apt/sources.list.d/bullseye-contrib.list
   apt-get update
-  apt-get install --yes curl debootstrap efibootmgr gdisk dkms dpkg-dev rng-tools "linux-headers-$(uname -r)"
-  apt-get install --yes -t bullseye-backports --no-install-recommends zfs-dkms zfsutils-linux
+  apt-get install --yes cryptsetup curl debootstrap efibootmgr gdisk dpkg-dev parted rng-tools "linux-headers-$(uname -r)"
+  apt-get install --yes zfsutils-linux
   modprobe zfs
 )
 else
@@ -71,23 +71,27 @@ fi
 echo_section "Partition disks"
 for id in "${DISK_IDS[@]}"; do
 ( set -x
-  # clear disk
+  # Clear disk
   wipefs -af "/dev/disk/by-id/${id}"
   sgdisk --zap-all "/dev/disk/by-id/${id}"
-  sync && partprobe "/dev/disk/by-id/${id}"
+  sync && partprobe "/dev/disk/by-id/${id}" && sleep 1
 
-  # discard device sectors
-  blkdiscard -sv "/dev/disk/by-id/${id}" || true
+  # Discard device sectors
+  blkdiscard -sv "/dev/disk/by-id/${id}" || blkdiscard -fv "/dev/disk/by-id/${id}" || true
+
+  # Always use 4k alignment
+  part_end=$(blockdev --getsize "/dev/disk/by-id/${id}")
+  part_end=$(( part_end - (part_end + 1) % 4096 ))
 
   if [[ "${BOOT_TYPE}" == "BIOS" ]]; then
     # Run this if you need legacy (BIOS) booting:
-    sgdisk -a1 -n1:24K:+1000K -t1:EF02 -c1:"BIOS" "/dev/disk/by-id/${id}"
+    sgdisk -a 1    -n1:24K:+1000K -t1:EF02 -c1:"BIOS" "/dev/disk/by-id/${id}"
   else
-    sgdisk     -n2:1M:+512M   -t2:EF00 -c2:"EFI System" "/dev/disk/by-id/${id}"
+    sgdisk -a 4096 -n2:1M:+512M   -t2:EF00 -c2:"EFI System" "/dev/disk/by-id/${id}"
   fi
   
-  sgdisk     -n3:0:+1G      -t3:BF01 -c3:"System Boot Pool" "/dev/disk/by-id/${id}"
-  sgdisk     -n4:0:0        -t4:8300 -c4:"System Root Pool" "/dev/disk/by-id/${id}"
+  sgdisk -n3:0:+1G         -t3:BF01 -c3:"System Boot Pool" "/dev/disk/by-id/${id}"
+  sgdisk -n4:0:${part_end} -t4:8300 -c4:"System Root Pool" "/dev/disk/by-id/${id}"
 
   # Let the kernel reread the partition table
   sync && partprobe "/dev/disk/by-id/${id}"
@@ -119,6 +123,8 @@ echo_section "Create boot pool"
 
   set -x
   zpool create -o ashift=12 -d \
+    -o autotrim=on \
+    -o cachefile=/etc/zfs/zpool.cache \
     -o feature@async_destroy=enabled \
     -o feature@bookmarks=enabled \
     -o feature@embedded_data=enabled \
@@ -128,23 +134,23 @@ echo_section "Create boot pool"
     -o feature@filesystem_limits=enabled \
     -o feature@hole_birth=enabled \
     -o feature@large_blocks=enabled \
+    -o feature@livelist=enabled \
     -o feature@lz4_compress=enabled \
     -o feature@spacemap_histogram=enabled \
-    -o feature@userobj_accounting=enabled \
     -o feature@zpool_checkpoint=enabled \
-    -o feature@spacemap_v2=enabled \
-    -o feature@project_quota=enabled \
-    -o feature@resilver_defer=enabled \
-    -o feature@allocation_classes=enabled \
-    -O acltype=posixacl -O canmount=off -O compression=lz4 -O devices=off \
-    -O normalization=formD -O relatime=on -O xattr=sa \
-    -O mountpoint=/ -R /target -f \
+    -O devices=off \
+    -O acltype=posixacl -O xattr=sa \
+    -O compression=lz4 \
+    -O normalization=formD \
+    -O relatime=on \
+    -O canmount=off -O mountpoint=/boot -R /target -f \
     "bpool" ${ZPOOL_TYPE} "${parts[@]}"
 )
 
 echo_section "Create root pool"
 ( set -x
   zpool create -o ashift=12 \
+    -o autotrim=on \
     -O acltype=posixacl -O canmount=off -O compression=lz4 \
     -O dnodesize=auto -O normalization=formD -O relatime=on -O xattr=sa \
     -O mountpoint=/ -R /target \
@@ -212,14 +218,13 @@ echo_section "Create swap zvol"
 echo_section "Install the minimal system"
 ( set -x
   debootstrap --arch amd64 bullseye /target http://deb.debian.org/debian
-  zfs set devices=off rpool
 )
 
 echo_section "Setup chroot environment"
 ( set -x
-  mount --rbind /dev  /target/dev
-  mount --rbind /proc /target/proc
-  mount --rbind /sys  /target/sys
+  mount --make-private --rbind /dev  /target/dev
+  mount --make-private --rbind /proc /target/proc
+  mount --make-private --rbind /sys  /target/sys
 )
 
 cat <<END_OF_CHROOT >/target/var/tmp/chroot-commands.sh
@@ -234,6 +239,7 @@ echo_section() {
 }
 
 export DEBIAN_FRONTEND=noninteractive
+export GRUB_DISABLE_OS_PROBER=true
 
 echo_section "Configure hostname"
 echo "${TARGET_HOSTNAME}" > /etc/hostname
@@ -252,7 +258,7 @@ deb http://deb.debian.org/debian bullseye-updates main contrib
 EOF
 
 echo_section "Configure proxmox pve repository"
-echo "deb http://download.proxmox.com/debian/pve bullseye pve-no-subscription" \
+echo "deb [arch=amd64] http://download.proxmox.com/debian/pve bullseye pve-no-subscription" \
   > /etc/apt/sources.list.d/proxmox.list
 
 base64 -d <<EOF > /etc/apt/trusted.gpg.d/proxmox-release-bullseye.gpg
@@ -305,6 +311,7 @@ apt-get install --yes \
   keyutils \
   openssh-server \
   rng-tools \
+  rsync \
   sudo \
   tmux \
   "\$(apt-cache -q0 depends proxmox-ve | sed -rn 's/.*(pve-kernel-[0-9]+\.[0-9]+).*/\1/p')" \
@@ -325,9 +332,12 @@ done
 
 echo_section "Install grub packages"
 if [[ "${BOOT_TYPE}" != "BIOS" ]]; then
-  mkdir /boot/efi
-  efi_uuid=\$(blkid -s UUID -o value "/dev/disk/by-id/\${DISK_IDS[0]}-part2")
-  echo "UUID=\${efi_uuid} /boot/efi vfat nofail,x-systemd.device-timeout=1 0 1" >> /etc/fstab
+  for i in "\${!DISK_IDS[@]}"; do
+    mkdir /boot/efi\${i/0/}
+    efi_uuid=\$(blkid -s UUID -o value "/dev/disk/by-id/\${DISK_IDS[\$i]}-part2")
+    echo "UUID=\${efi_uuid} /boot/efi\${i/0/} vfat nofail,x-systemd.device-timeout=1 0 1" >> /etc/fstab
+  done
+
   mount /boot/efi
 
   apt-get install --yes grub-efi-amd64 shim-signed
@@ -473,10 +483,20 @@ echo_section "Run generated chroot script"
 if [[ "${BOOT_TYPE}" != "BIOS" ]]; then
   # "This is arguably a mis-design in the UEFI specification - the ESP is a single point of failure on one disk."
   # https://wiki.debian.org/UEFI#RAID_for_the_EFI_System_Partition
+  # https://pve.proxmox.com/wiki/Host_Bootloader
   echo_section "Mirror ESP partition"
   for i in "${!DISK_IDS[@]}"; do
     if [[ "${i}" -gt "0" ]]; then
       ( set -x; dd if="/dev/disk/by-id/${DISK_IDS[0]}-part2" of="/dev/disk/by-id/${DISK_IDS[$i]}-part2" )
+
+      printf "%s\n" \
+        "!/bin/sh" \
+        "set -e" \
+        "" \
+        "if mount | grep -q '/boot/efi$i'; then" \
+        "  rsync -t --recursive --delete /boot/efi/ /boot/efi$i/" \
+        "fi" \
+        > "/target/etc/grub.d/90_copy_to_boot_efi$i"
     fi
     efibootmgr \
       --create \
@@ -488,7 +508,7 @@ fi
 
 echo_section "DONE"
 
-read -ep "Unmount target system? [Y/n]" choice
+read -ep "Umount target system? [Y/n]" choice
 
 if [[ "${choice}" =~ ^[nN](o)?$ ]]; then
   exit 0
